@@ -1,0 +1,243 @@
+---
+- name: Configure and deploy FastAPI application
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    venv_dir: /opt/app/.venv
+    app_user: appuser
+    app_group: appuser
+    app_port: 8000
+    artifact: "{{ app_artifact | default('/tmp/app.zip') }}"
+
+  tasks:
+    - name: Wait for apt lock to be released
+      shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+              fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+          sleep 2
+        done
+      changed_when: false
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install system packages
+      apt:
+        name:
+          - python3.11
+          - python3.11-venv
+          - python3.11-dev
+          - python3-pip
+          - nginx
+          - unzip
+          - curl
+          - build-essential
+        state: present
+
+    - name: Create app group
+      group:
+        name: "{{ app_group }}"
+        state: present
+
+    - name: Create app user
+      user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        home: "{{ app_dir }}"
+        shell: /bin/bash
+        system: yes
+        create_home: no
+        state: present
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: "0755"
+
+    - name: Copy application artifact to server
+      copy:
+        src: "{{ artifact }}"
+        dest: /tmp/app.zip
+        mode: "0644"
+
+    - name: Unzip application to app directory
+      unarchive:
+        src: /tmp/app.zip
+        dest: "{{ app_dir }}"
+        remote_src: yes
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+
+    - name: Create Python virtual environment
+      command: python3.11 -m venv {{ venv_dir }}
+      args:
+        creates: "{{ venv_dir }}/bin/activate"
+      become_user: "{{ app_user }}"
+
+    - name: Upgrade pip in venv
+      shell: "{{ venv_dir }}/bin/pip install --upgrade pip"
+      become_user: "{{ app_user }}"
+      changed_when: false
+
+    - name: Install Python dependencies from requirements.txt
+      shell: |
+        if [ -f "{{ app_dir }}/requirements.txt" ]; then
+          {{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt
+        fi
+      become_user: "{{ app_user }}"
+      changed_when: false
+
+    - name: Ensure gunicorn and uvicorn are installed in venv
+      shell: "{{ venv_dir }}/bin/pip install gunicorn uvicorn[standard] fastapi"
+      become_user: "{{ app_user }}"
+      changed_when: false
+
+    - name: Set correct ownership on app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: yes
+
+    - name: Write app environment file
+      shell: |
+        cat > {{ app_dir }}/.env << 'ENVEOF'
+        APP_ENV=production
+        PORT=8000
+        HOST=0.0.0.0
+        ENVEOF
+        chown {{ app_user }}:{{ app_group }} {{ app_dir }}/.env
+        chmod 640 {{ app_dir }}/.env
+      changed_when: false
+
+    - name: Create systemd service for app
+      copy:
+        dest: /etc/systemd/system/app.service
+        content: |
+          [Unit]
+          Description=FastAPI Application
+          After=network.target
+
+          [Service]
+          Type=notify
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          EnvironmentFile={{ app_dir }}/.env
+          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
+              -k uvicorn.workers.UvicornWorker \
+              -w 4 \
+              -b 0.0.0.0:{{ app_port }} \
+              --timeout 120 \
+              --keep-alive 5 \
+              --log-level info \
+              --access-logfile - \
+              --error-logfile -
+          ExecReload=/bin/kill -s HUP $MAINPID
+          KillMode=mixed
+          TimeoutStopSec=5
+          PrivateTmp=true
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart app service
+
+    - name: Configure Nginx
+      copy:
+        dest: /etc/nginx/sites-available/app
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name _;
+
+              client_max_body_size 64M;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_read_timeout 120s;
+                  proxy_connect_timeout 10s;
+              }
+          }
+        mode: "0644"
+      notify:
+        - Reload nginx
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify:
+        - Reload nginx
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start app service
+      systemd:
+        name: app
+        enabled: yes
+        state: started
+
+    - name: Enable and start Nginx
+      systemd:
+        name: nginx
+        enabled: yes
+        state: started
+
+    - name: Verify app service is running
+      shell: systemctl is-active app
+      register: app_status
+      changed_when: false
+      failed_when: app_status.stdout != 'active'
+
+    - name: Wait for app to respond on port 8000
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ app_port }}"
+        delay: 3
+        timeout: 60
+
+  handlers:
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Restart app service
+      systemd:
+        name: app
+        state: restarted
+
+    - name: Reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
